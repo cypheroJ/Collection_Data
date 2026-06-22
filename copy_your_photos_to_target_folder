@@ -1,0 +1,269 @@
+import os
+import re
+import shutil
+import pandas as pd
+from pathlib import Path
+
+# ======================
+# SETTINGS
+# ======================
+
+BASE_DIR = "your_base_path_for_easier_code_execution"
+SOURCE_DIR = "source_of_your_photos"
+DEST_DIR = os.path.join(BASE_DIR, "location_of_the_copied_photos")
+
+CSV_FILE = os.path.join(BASE_DIR, "csv_path_of_the_sampling_data_for_script_to_follow")
+
+os.makedirs(DEST_DIR, exist_ok=True)
+
+# ======================
+# FUNCTIONS
+# ======================
+
+def extract_picture_names(picture_field):
+    """Parse picture names from CSV field."""
+
+    picture_field = str(picture_field).strip()
+
+    if not picture_field or picture_field.lower() == "nan":
+        return []
+
+    parts = []
+
+    inside_parentheses = re.findall(
+        r'\((.*?)\)',
+        picture_field
+    )
+
+    for group in inside_parentheses:
+        parts += [
+            p.strip()
+            for p in group.split('&')
+            if p.strip()
+        ]
+
+    if not picture_field.startswith("https://"):
+
+        outside = re.sub(
+            r'\(.*?\)',
+            '',
+            picture_field
+        )
+
+        if outside:
+            parts += [
+                p.strip()
+                for p in outside.split('&')
+                if p.strip()
+            ]
+
+    return parts
+
+# ======================
+# LOAD CSV
+# ======================
+
+df = pd.read_csv(CSV_FILE, dtype=str)
+
+if "Picture name" not in df.columns:
+    raise ValueError(
+        "Column 'Picture name' not found."
+    )
+
+picture_names = set()
+
+for value in df["Picture name"].fillna(""):
+
+    for pic in extract_picture_names(value):
+
+        picture_names.add(pic)
+
+print(
+    f"Collected {len(picture_names)} unique picture names"
+)
+
+# ======================
+# INDEX SOURCE FILES
+# ======================
+
+print("Indexing source drive...")
+
+file_index = {}
+
+for root, dirs, files in os.walk(SOURCE_DIR):
+
+    for file in files:
+
+        file_index.setdefault(
+            file,
+            []
+        ).append(
+            os.path.join(root, file)
+        )
+
+print(
+    f"Indexed {len(file_index)} unique filenames "
+    f"from source drive"
+)
+
+# ======================
+# INDEX COLLECTION PHOTOS
+# ======================
+
+print("Indexing Collection Photos...")
+
+existing_files = set()
+
+for root, dirs, files in os.walk(DEST_DIR):
+
+    for file in files:
+        existing_files.add(file)
+
+print(
+    f"Found {len(existing_files)} existing files "
+    f"in Collection Photos"
+)
+
+# ======================
+# COPY FILES
+# ======================
+
+copied = []
+already_exists = []
+missing = []
+duplicates = []
+
+for filename in sorted(picture_names):
+
+    # Skip if already exists anywhere
+    if filename in existing_files:
+
+        already_exists.append(filename)
+        continue
+
+    matches = file_index.get(filename, [])
+
+    if len(matches) == 0:
+
+        missing.append(filename)
+        continue
+
+    if len(matches) > 1:
+
+        duplicates.append(filename)
+
+        print(
+            f"WARNING: multiple matches for {filename}"
+        )
+
+        for m in matches:
+            print(f"    {m}")
+
+        continue
+
+    src = matches[0]
+    dst = os.path.join(
+        DEST_DIR,
+        filename
+    )
+
+    try:
+
+        shutil.copy2(src, dst)
+
+        copied.append(filename)
+
+        print(
+            f"COPIED: {filename}"
+        )
+
+    except Exception as e:
+
+        print(
+            f"ERROR: {filename}: {e}"
+        )
+
+# ======================
+# WRITE REPORTS
+# ======================
+
+with open(
+    os.path.join(
+        DEST_DIR,
+        "copied_files.txt"
+    ),
+    "w"
+) as f:
+
+    f.write(
+        "\n".join(
+            sorted(copied)
+        )
+    )
+
+with open(
+    os.path.join(
+        DEST_DIR,
+        "already_exists.txt"
+    ),
+    "w"
+) as f:
+
+    f.write(
+        "\n".join(
+            sorted(already_exists)
+        )
+    )
+
+with open(
+    os.path.join(
+        DEST_DIR,
+        "missing_files.txt"
+    ),
+    "w"
+) as f:
+
+    f.write(
+        "\n".join(
+            sorted(missing)
+        )
+    )
+
+with open(
+    os.path.join(
+        DEST_DIR,
+        "duplicate_matches.txt"
+    ),
+    "w"
+) as f:
+
+    for filename in sorted(duplicates):
+
+        f.write(
+            f"\n{filename}\n"
+        )
+
+        for m in file_index.get(
+            filename,
+            []
+        ):
+            f.write(
+                f"    {m}\n"
+            )
+
+# ======================
+# SUMMARY
+# ======================
+
+print("\n========== SUMMARY ==========")
+print(f"Copied: {len(copied)}")
+print(
+    f"Already exists: "
+    f"{len(already_exists)}"
+)
+print(f"Missing: {len(missing)}")
+print(
+    f"Duplicates: "
+    f"{len(duplicates)}"
+)
+print("============================")
