@@ -18,11 +18,11 @@ auth.authenticate_user()
 service = build('drive', 'v3')
 
 # Paths
-base_dir = "/content/drive/Othercomputers/My Computer/GuanJie/ero"
-csv_path = os.path.join(base_dir, "Erotylidae.csv")
-output_csv_path = os.path.join(base_dir, "Erotylidae_updated.csv")
+base_dir = "your_base_path_(Make_the_input_cleaner)"
+csv_path = os.path.join(base_dir, "csv_path_of_your_sampling_data")
+output_csv_path = os.path.join(base_dir, "updated_csv_path_of_your_sampling_data")
 unmatched_log_path = os.path.join(base_dir, "unmatched_photos_log.txt")
-photos_dir = "/content/drive/MyDrive/Collection Photos"
+photos_dir = "path_of_your_photos"
 
 # === Read CSV ===
 if os.path.exists(output_csv_path):
