@@ -1,0 +1,261 @@
+# === Google Drive API + CSV Copy Script ===
+from google.colab import drive, auth
+import pandas as pd
+import os
+import re
+import time
+import urllib.parse
+import googleapiclient.errors
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+
+# === SETTINGS ===
+DRY_RUN = False          # If True → simulate without uploading or deleting
+DELETE_ONLY = False      # If True → skip uploads and only delete uploaded files from list
+
+# Authenticate & mount Drive
+auth.authenticate_user()
+service = build('drive', 'v3')
+
+# Paths
+base_dir = "/content/drive/Othercomputers/My Computer/GuanJie/ero"
+csv_path = os.path.join(base_dir, "Erotylidae.csv")
+output_csv_path = os.path.join(base_dir, "Erotylidae_updated.csv")
+unmatched_log_path = os.path.join(base_dir, "unmatched_photos_log.txt")
+photos_dir = "/content/drive/MyDrive/Collection Photos"
+
+# === Read CSV ===
+if os.path.exists(output_csv_path):
+    print(f"[INFO] Resuming from existing output file: {output_csv_path}")
+    df = pd.read_csv(output_csv_path, keep_default_na=False)
+else:
+    print(f"[INFO] Starting fresh from: {csv_path}")
+    try:
+        df = pd.read_csv(csv_path, keep_default_na=False, encoding="utf-8")
+    except UnicodeDecodeError:
+        print("[WARNING] UTF-8 failed, retrying with latin1...")
+        df = pd.read_csv(csv_path, keep_default_na=False, encoding="latin1")
+
+# === Helper functions ===
+def create_drive_folder(folder_name, parent_folder_id=None):
+    """Create a Drive folder and return its ID."""
+    file_metadata = {
+        'name': folder_name,
+        'mimeType': 'application/vnd.google-apps.folder'
+    }
+    if parent_folder_id:
+        file_metadata['parents'] = [parent_folder_id]
+    folder = service.files().create(body=file_metadata, fields='id').execute()
+    return folder['id']
+
+def make_shareable(file_id, max_retries=5):
+    """Make Drive folder shareable and return its link, with retry logic."""
+    for attempt in range(max_retries):
+        try:
+            permission = {'type': 'anyone', 'role': 'reader'}
+            service.permissions().create(fileId=file_id, body=permission).execute()
+            return f"https://drive.google.com/drive/folders/{file_id}"
+        except googleapiclient.errors.HttpError as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # exponential backoff
+                print(f"[WARNING] Shareable link creation failed (attempt {attempt+1}): {e}")
+                print(f"[INFO] Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+                continue
+            else:
+                print(f"[ERROR] Failed to make folder shareable after {max_retries} attempts: {e}")
+                return ""
+
+def upload_file_to_folder(local_path, folder_id):
+    """Upload a local file to a Drive folder."""
+    file_metadata = {
+        'name': os.path.basename(local_path),
+        'parents': [folder_id]
+    }
+    media = MediaFileUpload(local_path, resumable=True)
+    service.files().create(body=file_metadata, media_body=media).execute()
+
+def extract_picture_names(picture_field):
+    """Parse picture names from CSV field."""
+    picture_field = str(picture_field).strip()
+    if not picture_field:
+        return []
+    parts = []
+    inside_parentheses = re.findall(r'\((.*?)\)', picture_field)
+    for group in inside_parentheses:
+        parts += [p.strip() for p in group.split('&') if p.strip()]
+    if not picture_field.startswith("https://"):
+        outside = re.sub(r'\(.*?\)', '', picture_field)
+        if outside:
+            parts += [p.strip() for p in outside.split('&') if p.strip()]
+    return parts
+
+def get_drive_folder_by_name(name, parent_id):
+    """Search for a folder by name under a given parent. Return folder ID if found, else None."""
+    resp = service.files().list(
+        q=f"mimeType='application/vnd.google-apps.folder' and name='{name}' and '{parent_id}' in parents and trashed=false",
+        spaces='drive',
+        fields='files(id, name)'
+    ).execute()
+    if resp['files']:
+        return resp['files'][0]['id']
+    return None
+
+# Map available files (case-insensitive ext, skip MacOS junk)
+all_photo_files = {
+    f.lower(): os.path.join(photos_dir, f)
+    for f in os.listdir(photos_dir)
+    if os.path.isfile(os.path.join(photos_dir, f))
+    and not f.startswith("._")
+    and f.lower() != '.ds_store'
+    and not f.lower().endswith('.json')
+}
+
+# Logs
+unmatched_log = []
+files_to_delete = []
+
+# Parent folder ID for "Collection Photos"
+parent_id = None
+resp = service.files().list(q="name='Collection Photos' and mimeType='application/vnd.google-apps.folder'",
+                            spaces='drive', fields='files(id, name)').execute()
+if resp['files']:
+    parent_id = resp['files'][0]['id']
+else:
+    print("[ERROR] 'Collection Photos' folder not found in MyDrive")
+    raise SystemExit
+
+# === Main loop ===
+for idx, row in df.iterrows():
+    serial = str(row['Serial number']).strip()
+    picture_field = row['Picture name']
+    photo_links = row['Photo Links']
+
+    image_names = extract_picture_names(picture_field)
+    expected_count = len(image_names)
+
+    if not serial or picture_field == "": #or str(picture_field).startswith("https://"):
+        continue
+
+    # DELETE_ONLY mode → skip upload logic
+    if DELETE_ONLY:
+        continue
+
+    folder_id = None
+
+    # --- Check existing folder ---
+    existing_folder_id = get_drive_folder_by_name(serial, parent_id)
+    if existing_folder_id:
+        resp = service.files().list(
+            q=f"'{existing_folder_id}' in parents and trashed=false",
+            spaces='drive',
+            fields='files(id)'
+        ).execute()
+        actual_count = len(resp['files'])
+        if actual_count != expected_count:
+            print(f"[INFO] Existing folder '{serial}' incomplete ({actual_count}/{expected_count}). Replacing...")
+            try:
+                service.files().delete(fileId=existing_folder_id).execute()
+                folder_id = None
+            except Exception as e:
+                print(f"[ERROR] Failed to delete folder {serial}: {e}")
+        else:
+            print(f"[INFO] Folder '{serial}' complete. Skipping.")
+            df.at[idx, 'Photo Links'] = make_shareable(existing_folder_id)
+            print(f"[INFO] Shareable link generated: https://drive.google.com/drive/folders/{existing_folder_id}")
+            continue
+
+    # --- Create new folder ---
+    if DRY_RUN:
+        print(f"[DRY-RUN] Would create folder: {serial}")
+    else:
+        folder_id = create_drive_folder(serial, parent_folder_id=parent_id)
+        print(f"[INFO] Folder created: {serial}")
+
+    time.sleep(1.5)
+
+    # --- Upload images ---
+    unmatched = []
+    for name in image_names:
+        name_lower = name.lower()
+        matched_files = [
+            path for fname, path in all_photo_files.items()
+            if name_lower in fname
+        ]
+        if matched_files:
+            for src in matched_files:
+                if os.path.basename(src).startswith("._") or os.path.basename(src).lower() == '.ds_store':
+                    continue
+                if DRY_RUN:
+                    print(f"[DRY-RUN] Would upload {src}")
+                else:
+                    try:
+                        upload_file_to_folder(src, folder_id)
+                        files_to_delete.append(src)  # Only after successful upload
+                        print(f"[INFO] Uploaded {src}")
+                    except Exception as e:
+                        print(f"[ERROR] Failed to upload {src}: {e}")
+        else:
+            unmatched.append(name)
+
+    if unmatched:
+        unmatched_msg = f"Serial: {serial} - Unmatched: {', '.join(unmatched)}"
+        print(f"[WARNING] {unmatched_msg}")
+        unmatched_log.append(unmatched_msg)
+
+    if not DRY_RUN:
+        link = make_shareable(folder_id)
+        df.at[idx, 'Photo Links'] = link
+        print(f"[INFO] Shareable link generated: {link}")
+
+    df.to_csv(output_csv_path, index=False)
+
+# Save unmatched log
+with open(unmatched_log_path, 'w') as f:
+    f.write("\n".join(unmatched_log))
+
+# === DELETE_ONLY execution ===
+if DELETE_ONLY and not DRY_RUN:
+    print("[INFO] DELETE_ONLY mode: Removing previously uploaded files...")
+
+    for idx, row in df.iterrows():
+        serial = str(row['Serial number']).strip()
+        picture_field = row['Picture name']
+        image_names = extract_picture_names(picture_field)
+
+        if not image_names:
+            continue
+
+        for name in image_names:
+            name_lower = name.lower()
+            matched_files = [
+                path for fname, path in all_photo_files.items()
+                if name_lower in fname
+            ]
+            for file_path in matched_files:
+                try:
+                    os.remove(file_path)
+                    print(f"[INFO] Deleted ({serial}): {file_path}")
+                except Exception as e:
+                    print(f"[ERROR] Failed to delete {file_path}: {e}")
+
+    # --- Global junk cleanup ---
+    print("[INFO] Scanning for leftover junk files (.json, .DS_Store, ._*)...")
+    for fname in os.listdir(photos_dir):
+        fpath = os.path.join(photos_dir, fname)
+        if not os.path.isfile(fpath):
+            continue
+        lower = fname.lower()
+        if lower.endswith(".json") or lower == ".ds_store" or fname.startswith("._") or fname.endswith(".MP"):
+            try:
+                os.remove(fpath)
+                print(f"[INFO] Deleted junk: {fpath}")
+            except Exception as e:
+                print(f"[ERROR] Failed to delete junk {fpath}: {e}")
+
+    print("[INFO] DELETE_ONLY mode completed.")
+
+
+print(f"\n✅ Script completed. DRY_RUN={DRY_RUN}, DELETE_ONLY={DELETE_ONLY}")
+print(f"Output CSV: {output_csv_path}")
+print(f"Unmatched log: {unmatched_log_path}")
